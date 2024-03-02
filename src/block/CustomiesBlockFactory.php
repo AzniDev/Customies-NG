@@ -29,8 +29,10 @@ use pocketmine\world\format\io\GlobalBlockStateHandlers;
 use function array_map;
 use function array_merge;
 use function array_reverse;
-use function defined;
+use function hash;
 use function ksort;
+use function strcmp;
+use function usort;
 
 final class CustomiesBlockFactory {
 	use SingletonTrait;
@@ -44,6 +46,7 @@ final class CustomiesBlockFactory {
 	private array $blockPaletteEntries = [];
 	/** @var array<string, Block> */
 	private array $customBlocks = [];
+	private bool $sorted = false;
 
 	/**
 	 * Adds a worker initialize hook to the async pool to sync the BlockFactory for every thread worker that is created.
@@ -70,10 +73,13 @@ final class CustomiesBlockFactory {
 
 	/**
 	 * Returns all the block palette entries that need to be sent to the client.
-	 * @return BlockPaletteEntry[]
+	 * @return BlockPaletteEntry[]|BlockPaletteEntry[][]
 	 */
-	public function getBlockPaletteEntries(int $protocolId): array {
+	public function getBlockPaletteEntries(?int $protocolId = null): array {
 		ksort($this->blockPaletteEntries);
+		if($protocolId === null){
+			return $this->blockPaletteEntries;
+		}
 		$blockPaletteEntries = [];
 		foreach($this->blockPaletteEntries as $paletteProtocol => $entries){
 			if($protocolId <= $paletteProtocol){
@@ -91,6 +97,9 @@ final class CustomiesBlockFactory {
 	 * @phpstan-param null|(Closure(Block): BlockStateReader) $deserializer
 	 */
 	public function registerBlock(Closure $blockFunc, string $identifier, ?Model $model = null, ?CreativeInventoryInfo $creativeInfo = null, ?Closure $serializer = null, ?Closure $deserializer = null): void {
+		if($this->sorted){
+			throw new \RuntimeException("Server already started");
+		}
 		$block = $blockFunc();
 		if(!$block instanceof Block) {
 			throw new InvalidArgumentException("Class returned from closure is not a Block");
@@ -179,21 +188,41 @@ final class CustomiesBlockFactory {
 			->setString("group", $creativeInfo->getGroup()));
 		foreach($propertiesProtocol as $protocolId){
 			$propertiesTags[$protocolId]
-				->setTag("components", defined(ProtocolInfo::class . "::PROTOCOL_1_20_10") && $protocolId >= ProtocolInfo::PROTOCOL_1_20_10 ?
-					$components : (clone $components)->setTag("minecraft:geometry", CompoundTag::create()
-						->setString("value", $components->getCompoundTag("minecraft:geometry")
-							->getString("identifier"))))
+				->setTag("components", $components)
 				->setTag("menu_category", CompoundTag::create()
 					->setString("category", $creativeInfo->getCategory() ?? "")
 					->setString("group", $creativeInfo->getGroup() ?? ""))
 				->setInt("molangVersion", 1);
 		}
 
-		CreativeInventory::getInstance()->add($block->asItem());
+		try{
+			CreativeInventory::getInstance()->add($block->asItem());
+		}catch(\Error){
+		}
 
 		foreach($propertiesTags as $protocolId => $propertiesTag){
 			$this->blockPaletteEntries[$protocolId][] = new BlockPaletteEntry($identifier, new CacheableNbt($propertiesTag));
 		}
 		$this->blockFuncs[$identifier] = [$blockFunc, $serializer, $deserializer];
+	}
+
+	public function sort() : void{
+		foreach($this->blockPaletteEntries as $protocolId => $entries){
+			if($protocolId < 649){
+				continue;
+			}
+			// 1.20.60 added a new "block_id" field which depends on the order of the block palette entries. Every time we
+			// insert a new block, we need to re-sort the block palette entries to keep in sync with the client.
+			usort($entries, static function(BlockPaletteEntry $a, BlockPaletteEntry $b): int {
+				return strcmp(hash("fnv164", $a->getName()), hash("fnv164", $b->getName()));
+			});
+			foreach($entries as $i => $entry){
+				$root = $entry->getStates()->getRoot()
+					->setTag("vanilla_block_data", CompoundTag::create()
+						->setInt("block_id", 10000 + $i));
+				$this->blockPaletteEntries[$protocolId][$i] = new BlockPaletteEntry($entry->getName(), new CacheableNbt($root));
+			}
+		}
+		$this->sorted = true;
 	}
 }
